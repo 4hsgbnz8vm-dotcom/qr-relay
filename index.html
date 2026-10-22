@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>QR 전달</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #111; color: #eee;
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; overflow: hidden; }
+  #main { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #qr { width: min(96vw, 96vh); height: min(96vw, 96vh); image-rendering: pixelated; background: #fff; }
+  #dec { width: 100vw; height: 100vh; object-fit: contain; image-rendering: pixelated; }
+  #insets { position: fixed; left: 8px; bottom: 8px; display: flex; gap: 6px; align-items: flex-end; }
+  #insets .box { background: #000; border: 1px solid #444; }
+  #insets .box span { display: block; font-size: 10px; color: #aaa; padding: 2px 4px; }
+  #insets video, #insets canvas { display: block; width: 96px; height: 72px; object-fit: contain; image-rendering: pixelated; background: #000; }
+  #stats { position: fixed; right: 8px; bottom: 8px; font: 11px/1.4 ui-monospace, Menlo, monospace;
+    background: rgba(0,0,0,.7); padding: 6px 8px; border-radius: 4px; white-space: pre; }
+  #stats .bad { color: #ff6b6b; }
+  #panel { position: fixed; top: 0; left: 0; right: 0; background: rgba(20,20,20,.95); padding: 10px 12px;
+    display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; border-bottom: 1px solid #333; z-index: 5; }
+  #panel.hidden { display: none; }
+  #panel label { display: flex; align-items: center; gap: 6px; }
+  #panel input[type=number] { width: 56px; }
+  #panel select, #panel input, #panel button { font: inherit; background: #222; color: #eee; border: 1px solid #555; border-radius: 4px; padding: 4px 6px; }
+  #panel button.primary { background: #eee; color: #111; border-color: #eee; }
+  #cap { font-size: 12px; color: #aaa; }
+  #cap.over { color: #ff6b6b; }
+  #toggle { position: fixed; top: 8px; right: 8px; z-index: 6; background: rgba(0,0,0,.6); color: #eee;
+    border: 1px solid #555; border-radius: 4px; padding: 4px 10px; font: inherit; }
+  .hide { display: none !important; }
+</style>
+</head>
+<body>
+<div id="main">
+  <canvas id="qr"></canvas>
+  <canvas id="dec" class="hide"></canvas>
+</div>
+
+<div id="insets">
+  <div class="box" id="bVideo"><video id="video" playsinline muted autoplay></video><span>카메라</span></div>
+  <div class="box" id="bDec"><canvas id="decSmall"></canvas><span>받은 것</span></div>
+  <div class="box" id="bEnc"><canvas id="enc"></canvas><span>보내는 것</span></div>
+</div>
+<div id="stats"></div>
+
+<div id="panel">
+  <label>모드
+    <select id="mode">
+      <option value="send">보내기 (카메라 → QR)</option>
+      <option value="receive">받기 (QR → 이미지)</option>
+      <option value="relay">중계 (QR → 이미지 → 내 QR)</option>
+    </select>
+  </label>
+  <label>카메라 <select id="cam"><option value="">기본(후면)</option></select></label>
+  <label>내 언어: 가로 <input type="number" id="W" min="4" max="255"></label>
+  <label>세로 <input type="number" id="H" min="4" max="255"></label>
+  <label>밝기 단계
+    <select id="bits">
+      <option value="1">2</option><option value="2">4</option><option value="3">8</option>
+      <option value="4">16</option><option value="5">32</option><option value="6">64</option>
+      <option value="8">256</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="dither"> 디더</label>
+  <label>오류정정
+    <select id="ec"><option>L</option><option>M</option><option>Q</option><option>H</option></select>
+  </label>
+  <label>스캔 해상도
+    <select id="scanW"><option>640</option><option>960</option><option>1280</option><option>1920</option></select>
+  </label>
+  <label>보내기 fps <input type="number" id="fps" min="1" max="60"></label>
+  <span id="cap"></span>
+  <button id="start" class="primary">시작</button>
+  <button id="insetBtn">작은 화면 숨김</button>
+</div>
+<button id="toggle">설정</button>
+
+<script>
+const $ = id => document.getElementById(id);
+const DEFAULTS = { mode: 'send', W: 40, H: 30, bits: 3, dither: true, ec: 'L', scanW: 960, fps: 15 };
+let S = Object.assign({}, DEFAULTS);
+try { Object.assign(S, JSON.parse(localStorage.getItem('qrrelay') || '{}')); } catch (e) {}
+const save = () => { try { localStorage.setItem('qrrelay', JSON.stringify(S)); } catch (e) {} };
+
+const MAX_BYTES = { L: 2953, M: 2331, Q: 1663, H: 1273 };
+const video = $('video'), qrC = $('qr'), decC = $('dec'), decSmall = $('decSmall'), encC = $('enc');
+const work = document.createElement('canvas'), wctx = work.getContext('2d', { willReadFrequently: true });
+const scan = document.createElement('canvas'), scanCtx = scan.getContext('2d', { willReadFrequently: true });
+const BAYER = [0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5];
+
+let stream = null, running = false, seq = 0, lastSend = 0, wakeLock = null;
+let st = { tries: 0, ok: 0, sent: 0, lastOk: 0, ver: '-', bytes: 0, inInfo: '-', err: '', rate: 0, okRate: 0 };
+
+// ---------- 설정 UI ----------
+function syncUI() {
+  $('mode').value = S.mode; $('W').value = S.W; $('H').value = S.H; $('bits').value = S.bits;
+  $('dither').checked = S.dither; $('ec').value = S.ec; $('scanW').value = S.scanW; $('fps').value = S.fps;
+  updateCap(); applyMode();
+}
+function readUI() {
+  S.mode = $('mode').value;
+  S.W = Math.max(4, Math.min(255, +$('W').value || 40));
+  S.H = Math.max(4, Math.min(255, +$('H').value || 30));
+  S.bits = +$('bits').value; S.dither = $('dither').checked; S.ec = $('ec').value;
+  S.scanW = +$('scanW').value; S.fps = Math.max(1, Math.min(60, +$('fps').value || 15));
+  save(); updateCap(); applyMode();
+}
+function capacity() { return 6 + Math.ceil(S.W * S.H * S.bits / 8); }
+function updateCap() {
+  const c = capacity(), m = MAX_BYTES[S.ec];
+  $('cap').textContent = `${c} / ${m} 바이트`;
+  $('cap').classList.toggle('over', c > m);
+}
+function applyMode() {
+  const m = S.mode;
+  qrC.classList.toggle('hide', m === 'receive');
+  decC.classList.toggle('hide', m !== 'receive');
+  $('bDec').classList.toggle('hide', m !== 'relay');
+  $('bEnc').classList.toggle('hide', m === 'receive');
+}
+['mode','W','H','bits','dither','ec','scanW','fps'].forEach(id => $(id).addEventListener('change', readUI));
+$('toggle').onclick = () => $('panel').classList.toggle('hidden');
+$('insetBtn').onclick = () => {
+  const ins = $('insets'); ins.classList.toggle('hide');
+  $('insetBtn').textContent = ins.classList.contains('hide') ? '작은 화면 보이기' : '작은 화면 숨김';
+};
+$('cam').onchange = () => { if (running) startCamera(); };
+$('start').onclick = async () => {
+  readUI();
+  await startCamera();
+  running = true;
+  $('panel').classList.add('hidden');
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  requestAnimationFrame(tick);
+};
+
+// ---------- 카메라 ----------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  const id = $('cam').value;
+  const v = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+  if (id) v.deviceId = { exact: id }; else v.facingMode = { ideal: 'environment' };
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false });
+  } catch (e) {
+    st.err = '카메라 실패: ' + e.message; alert(st.err); return;
+  }
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const sel = $('cam'), cur = sel.value;
+  sel.innerHTML = '<option value="">기본(후면)</option>' +
+    devs.map((d, i) => `<option value="${d.deviceId}">${d.label || '카메라 ' + (i + 1)}</option>`).join('');
+  sel.value = cur;
+}
+
+// ---------- 인코딩 ----------
+function quantize(img, W, H, bits, dither) {
+  const L = (1 << bits) - 1, d = img.data, out = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const i = y * W + x;
+    let g = 0.299 * d[i*4] + 0.587 * d[i*4+1] + 0.114 * d[i*4+2];
+    if (dither) g += (BAYER[(y & 3) * 4 + (x & 3)] / 16 - 0.5 + 1 / 32) * 255 / L;
+    out[i] = Math.max(0, Math.min(L, Math.round(g / 255 * L)));
+  }
+  return out;
+}
+function pack(vals, bits) {
+  const out = new Uint8Array(Math.ceil(vals.length * bits / 8));
+  let p = 0;
+  for (let i = 0; i < vals.length; i++)
+    for (let b = bits - 1; b >= 0; b--, p++)
+      if ((vals[i] >> b) & 1) out[p >> 3] |= 0x80 >> (p & 7);
+  return out;
+}
+function unpack(bytes, off, n, bits) {
+  const out = new Uint8Array(n);
+  let p = off * 8;
+  for (let i = 0; i < n; i++) {
+    let v = 0;
+    for (let b = 0; b < bits; b++, p++) v = (v << 1) | ((bytes[p >> 3] >> (7 - (p & 7))) & 1);
+    out[i] = v;
+  }
+  return out;
+}
+function buildPacket(vals) {
+  const body = pack(vals, S.bits), p = new Uint8Array(6 + body.length);
+  p.set([0x51, 1, S.W, S.H, S.bits, (seq++) & 255]); p.set(body, 6);
+  return p;
+}
+function drawValues(canvas, vals, W, H, bits) {
+  if (canvas.width !== W) canvas.width = W;
+  if (canvas.height !== H) canvas.height = H;
+  const ctx = canvas.getContext('2d'), img = ctx.createImageData(W, H), L = (1 << bits) - 1;
+  for (let i = 0; i < W * H; i++) {
+    const v = Math.round(vals[i] * 255 / L);
+    img.data[i*4] = img.data[i*4+1] = img.data[i*4+2] = v; img.data[i*4+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function renderQR(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 4096) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 4096));
+  const q = qrcode(0, S.ec);
+  q.addData(s, 'Byte'); q.make();
+  const n = q.getModuleCount(), m = n + 8;
+  if (qrC.width !== m) { qrC.width = m; qrC.height = m; }
+  const ctx = qrC.getContext('2d'), img = ctx.createImageData(m, m);
+  img.data.fill(255);
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) {
+    const k = ((r + 4) * m + (c + 4)) * 4; img.data[k] = img.data[k+1] = img.data[k+2] = 0;
+  }
+  ctx.putImageData(img, 0, 0);
+  st.ver = (n - 17) / 4; st.bytes = bytes.length; st.sent++;
+}
+function encodeFrom(src, sx, sy, sw, sh) {
+  if (capacity() > MAX_BYTES[S.ec]) { st.err = '용량 초과: 해상도나 단계를 줄여줘'; return; }
+  work.width = S.W; work.height = S.H;
+  wctx.imageSmoothingEnabled = true; wctx.imageSmoothingQuality = 'high';
+  wctx.drawImage(src, sx, sy, sw, sh, 0, 0, S.W, S.H);
+  const vals = quantize(wctx.getImageData(0, 0, S.W, S.H), S.W, S.H, S.bits, S.dither);
+  drawValues(encC, vals, S.W, S.H, S.bits);
+  try { renderQR(buildPacket(vals)); st.err = ''; } catch (e) { st.err = 'QR 생성 실패: ' + e; }
+}
+
+// ---------- 루프 ----------
+function doSend(now) {
+  if (now - lastSend < 1000 / S.fps) return;
+  lastSend = now;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const ta = S.W / S.H, va = vw / vh;
+  let sx = 0, sy = 0, sw = vw, sh = vh;
+  if (va > ta) { sw = vh * ta; sx = (vw - sw) / 2; } else { sh = vw / ta; sy = (vh - sh) / 2; }
+  encodeFrom(video, sx, sy, sw, sh);
+}
+function doReceive(now) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const w = Math.min(S.scanW, vw), h = Math.round(vh * w / vw);
+  if (scan.width !== w) scan.width = w;
+  if (scan.height !== h) scan.height = h;
+  scanCtx.drawImage(video, 0, 0, w, h);
+  const code = jsQR(scanCtx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'dontInvert' });
+  st.tries++;
+  if (!code) return;
+  const b = code.binaryData;
+  if (b.length < 6 || b[0] !== 0x51) return;
+  const W = b[2], H = b[3], bits = b[4], n = W * H;
+  if (!W || !H || !bits || b.length < 6 + Math.ceil(n * bits / 8)) return;
+  const vals = unpack(b, 6, n, bits);
+  const target = S.mode === 'relay' ? decSmall : decC;
+  drawValues(target, vals, W, H, bits);
+  st.ok++; st.lastOk = now; st.inInfo = `${W}×${H} ${1 << bits}단계`;
+  if (S.mode === 'relay') encodeFrom(decSmall, 0, 0, W, H); // 내 언어로 다시 말하기
+}
+function tick(now) {
+  if (!running) return;
+  if (video.readyState >= 2 && video.videoWidth) {
+    if (S.mode === 'send') doSend(now); else doReceive(now);
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---------- 상태 표시 ----------
+let prev = { ok: 0, tries: 0, sent: 0, t: performance.now() };
+setInterval(() => {
+  const now = performance.now(), dt = (now - prev.t) / 1000;
+  const okps = (st.ok - prev.ok) / dt, tryps = (st.tries - prev.tries) / dt, sentps = (st.sent - prev.sent) / dt;
+  prev = { ok: st.ok, tries: st.tries, sent: st.sent, t: now };
+  const lines = [];
+  if (S.mode !== 'send') {
+    const gap = st.lastOk ? now - st.lastOk : Infinity;
+    lines.push(`수신 ${okps.toFixed(1)}/s  스캔 ${tryps.toFixed(1)}/s`);
+    lines.push(`성공률 ${tryps ? Math.round(okps / tryps * 100) : 0}%`);
+    lines.push(`받은 언어 ${st.inInfo}`);
+    lines.push(gap > 500 ? `<span class="bad">끊김 ${gap === Infinity ? '-' : (gap / 1000).toFixed(1) + 's'}</span>` : '연결됨');
+  }
+  if (S.mode !== 'receive') {
+    lines.push(`송신 ${sentps.toFixed(1)}/s  QR v${st.ver}  ${st.bytes}B`);
+    lines.push(`내 언어 ${S.W}×${S.H} ${1 << S.bits}단계`);
+  }
+  if (st.err) lines.push(`<span class="bad">${st.err}</span>`);
+  $('stats').innerHTML = running ? lines.join('\n') : '설정 후 시작';
+}, 500);
+
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && running) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+});
+
+syncUI();
+</script>
+</body>
+</html>
