@@ -60,14 +60,19 @@
   <label>카메라 <select id="cam"><option value="">기본(후면)</option></select></label>
   <label>내 언어: 가로 <input type="number" id="W" min="4" max="255"></label>
   <label>세로 <input type="number" id="H" min="4" max="255"></label>
-  <label>밝기 단계
+  <label>형식
+    <select id="fmt"><option value="raw">흑백 픽셀</option><option value="jpeg">JPEG 컬러</option></select>
+  </label>
+  <label class="jpegOnly">JPEG 화질 <input type="number" id="q" min="1" max="100"></label>
+  <label class="jpegOnly">최대 바이트 <input type="number" id="budget" min="300" max="2953" step="50"></label>
+  <label class="rawOnly">밝기 단계
     <select id="bits">
       <option value="1">2</option><option value="2">4</option><option value="3">8</option>
       <option value="4">16</option><option value="5">32</option><option value="6">64</option>
       <option value="8">256</option>
     </select>
   </label>
-  <label><input type="checkbox" id="dither"> 디더</label>
+  <label class="rawOnly"><input type="checkbox" id="dither"> 디더</label>
   <label>오류정정
     <select id="ec"><option>L</option><option>M</option><option>Q</option><option>H</option></select>
   </label>
@@ -84,7 +89,7 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const DEFAULTS = { mode: 'send', W: 40, H: 30, bits: 3, dither: true, ec: 'L', scanW: 960, fps: 15 };
+const DEFAULTS = { mode: 'send', W: 40, H: 30, bits: 3, dither: true, ec: 'L', scanW: 960, fps: 15, fmt: 'raw', q: 50, budget: 2000 };
 let S = Object.assign({}, DEFAULTS);
 try { Object.assign(S, JSON.parse(localStorage.getItem('qrrelay') || '{}')); } catch (e) {}
 const save = () => { try { localStorage.setItem('qrrelay', JSON.stringify(S)); } catch (e) {} };
@@ -95,6 +100,7 @@ const work = document.createElement('canvas'), wctx = work.getContext('2d', { wi
 const scan = document.createElement('canvas'), scanCtx = scan.getContext('2d', { willReadFrequently: true });
 const BAYER = [0,8,2,10,12,4,14,6,3,11,1,9,15,7,13,5];
 
+let decoding = false;
 let stream = null, running = false, seq = 0, lastSend = 0, wakeLock = null;
 let st = { tries: 0, ok: 0, sent: 0, lastOk: 0, ver: '-', bytes: 0, inInfo: '-', err: '', rate: 0, okRate: 0 };
 
@@ -102,6 +108,7 @@ let st = { tries: 0, ok: 0, sent: 0, lastOk: 0, ver: '-', bytes: 0, inInfo: '-',
 function syncUI() {
   $('mode').value = S.mode; $('W').value = S.W; $('H').value = S.H; $('bits').value = S.bits;
   $('dither').checked = S.dither; $('ec').value = S.ec; $('scanW').value = S.scanW; $('fps').value = S.fps;
+  $('fmt').value = S.fmt; $('q').value = S.q; $('budget').value = S.budget;
   updateCap(); applyMode();
 }
 function readUI() {
@@ -110,10 +117,19 @@ function readUI() {
   S.H = Math.max(4, Math.min(255, +$('H').value || 30));
   S.bits = +$('bits').value; S.dither = $('dither').checked; S.ec = $('ec').value;
   S.scanW = +$('scanW').value; S.fps = Math.max(1, Math.min(60, +$('fps').value || 15));
+  S.fmt = $('fmt').value; S.q = Math.max(1, Math.min(100, +$('q').value || 50));
+  S.budget = Math.max(300, Math.min(2953, +$('budget').value || 2000));
   save(); updateCap(); applyMode();
 }
 function capacity() { return 6 + Math.ceil(S.W * S.H * S.bits / 8); }
 function updateCap() {
+  document.querySelectorAll('.jpegOnly').forEach(e => e.classList.toggle('hide', S.fmt !== 'jpeg'));
+  document.querySelectorAll('.rawOnly').forEach(e => e.classList.toggle('hide', S.fmt === 'jpeg'));
+  if (S.fmt === 'jpeg') {
+    const m = MAX_BYTES[S.ec];
+    $('cap').textContent = `최대 ${Math.min(S.budget, m)} / ${m} 바이트`;
+    $('cap').classList.remove('over'); return;
+  }
   const c = capacity(), m = MAX_BYTES[S.ec];
   $('cap').textContent = `${c} / ${m} 바이트`;
   $('cap').classList.toggle('over', c > m);
@@ -125,7 +141,7 @@ function applyMode() {
   $('bDec').classList.toggle('hide', m !== 'relay');
   $('bEnc').classList.toggle('hide', m === 'receive');
 }
-['mode','W','H','bits','dither','ec','scanW','fps'].forEach(id => $(id).addEventListener('change', readUI));
+['mode','W','H','bits','dither','ec','scanW','fps','fmt','q','budget'].forEach(id => $(id).addEventListener('change', readUI));
 $('toggle').onclick = () => $('panel').classList.toggle('hidden');
 $('insetBtn').onclick = () => {
   const ins = $('insets'); ins.classList.toggle('hide');
@@ -238,7 +254,27 @@ function renderQR(bytes) {
   ctx.putImageData(img, 0, 0);
   st.ver = (n - 17) / 4; st.bytes = bytes.length; st.sent++;
 }
+function jpegBytes(q) {
+  const url = work.toDataURL('image/jpeg', q / 100);
+  const bin = atob(url.slice(url.indexOf(',') + 1));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function encodeJpeg(src, sx, sy, sw, sh) {
+  work.width = S.W; work.height = S.H;
+  wctx.imageSmoothingEnabled = true; wctx.imageSmoothingQuality = 'high';
+  wctx.drawImage(src, sx, sy, sw, sh, 0, 0, S.W, S.H);
+  const limit = Math.min(S.budget, MAX_BYTES[S.ec]);
+  let q = S.q, bytes = jpegBytes(q);
+  while (bytes.length > limit && q > 1) { q = Math.max(1, Math.floor(q * 0.7)); bytes = jpegBytes(q); }
+  if (bytes.length > limit) { st.err = 'JPEG가 너무 큼: 해상도를 줄여줘'; return; }
+  encC.width = S.W; encC.height = S.H; encC.getContext('2d').drawImage(work, 0, 0);
+  st.q = q;
+  try { renderQR(bytes); st.err = ''; } catch (e) { st.err = 'QR 생성 실패: ' + e; }
+}
 function encodeFrom(src, sx, sy, sw, sh) {
+  if (S.fmt === 'jpeg') return encodeJpeg(src, sx, sy, sw, sh);
   if (capacity() > MAX_BYTES[S.ec]) { st.err = '용량 초과: 해상도나 단계를 줄여줘'; return; }
   work.width = S.W; work.height = S.H;
   wctx.imageSmoothingEnabled = true; wctx.imageSmoothingQuality = 'high';
@@ -268,11 +304,23 @@ function doReceive(now) {
   st.tries++;
   if (!code) return;
   const b = code.binaryData;
+  const target = S.mode === 'relay' ? decSmall : decC;
+  if (b.length > 4 && b[0] === 0xFF && b[1] === 0xD8) {
+    if (decoding) return;
+    decoding = true;
+    createImageBitmap(new Blob([Uint8Array.from(b)], { type: 'image/jpeg' })).then(bmp => {
+      target.width = bmp.width; target.height = bmp.height;
+      target.getContext('2d').drawImage(bmp, 0, 0);
+      st.ok++; st.lastOk = performance.now(); st.inInfo = `${bmp.width}×${bmp.height} JPEG ${b.length}B`;
+      if (S.mode === 'relay') encodeFrom(target, 0, 0, bmp.width, bmp.height);
+      bmp.close && bmp.close();
+    }).catch(() => {}).finally(() => { decoding = false; });
+    return;
+  }
   if (b.length < 6 || b[0] !== 0x51) return;
   const W = b[2], H = b[3], bits = b[4], n = W * H;
   if (!W || !H || !bits || b.length < 6 + Math.ceil(n * bits / 8)) return;
   const vals = unpack(b, 6, n, bits);
-  const target = S.mode === 'relay' ? decSmall : decC;
   drawValues(target, vals, W, H, bits);
   st.ok++; st.lastOk = now; st.inInfo = `${W}×${H} ${1 << bits}단계`;
   if (S.mode === 'relay') encodeFrom(decSmall, 0, 0, W, H); // 내 언어로 다시 말하기
@@ -301,7 +349,7 @@ setInterval(() => {
   }
   if (S.mode !== 'receive') {
     lines.push(`송신 ${sentps.toFixed(1)}/s  QR v${st.ver}  ${st.bytes}B`);
-    lines.push(`내 언어 ${S.W}×${S.H} ${1 << S.bits}단계`);
+    lines.push(S.fmt === 'jpeg' ? `내 언어 ${S.W}×${S.H} JPEG 화질 ${st.q || S.q}` : `내 언어 ${S.W}×${S.H} ${1 << S.bits}단계`);
   }
   if (st.err) lines.push(`<span class="bad">${st.err}</span>`);
   $('stats').innerHTML = running ? lines.join('\n') : '설정 후 시작';
