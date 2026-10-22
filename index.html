@@ -31,6 +31,8 @@
   #cap.over { color: #ff6b6b; }
   #toggle { position: fixed; top: 8px; right: 8px; z-index: 6; background: rgba(0,0,0,.6); color: #eee;
     border: 1px solid #555; border-radius: 4px; padding: 4px 10px; font: inherit; }
+  #errbox { position: fixed; left: 12px; right: 12px; top: 50%; transform: translateY(-50%); z-index: 7;
+    background: #3a1214; color: #ffd6d6; border: 1px solid #ff6b6b; border-radius: 6px; padding: 14px 16px; text-align: center; }
   .hide { display: none !important; }
 </style>
 </head>
@@ -78,6 +80,7 @@
   <button id="insetBtn">작은 화면 숨김</button>
 </div>
 <button id="toggle">설정</button>
+<div id="errbox" class="hide"></div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -131,7 +134,7 @@ $('insetBtn').onclick = () => {
 $('cam').onchange = () => { if (running) startCamera(); };
 $('start').onclick = async () => {
   readUI();
-  await startCamera();
+  if (!(await startCamera())) return;
   running = true;
   $('panel').classList.add('hidden');
   try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
@@ -144,11 +147,24 @@ async function startCamera() {
   const id = $('cam').value;
   const v = { width: { ideal: 1920 }, height: { ideal: 1080 } };
   if (id) v.deviceId = { exact: id }; else v.facingMode = { ideal: 'environment' };
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showErr('이 브라우저는 카메라를 못 써요 (https 주소인지 확인)'); return false;
+  }
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false });
-  } catch (e) {
-    st.err = '카메라 실패: ' + e.message; alert(st.err); return;
+  } catch (e1) {
+    try { stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false }); }
+    catch (e) {
+      const why = {
+        NotAllowedError: '카메라 권한이 거부됨 → 브라우저/시스템 설정에서 허용',
+        NotFoundError: '카메라를 못 찾음',
+        NotReadableError: '다른 앱이 카메라를 쓰는 중',
+        OverconstrainedError: '카메라 설정이 안 맞음'
+      }[e.name] || e.message;
+      showErr(`카메라 실패 (${e.name}): ${why}`); return false;
+    }
   }
+  $('errbox').classList.add('hide');
   video.srcObject = stream;
   await video.play().catch(() => {});
   const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
@@ -156,6 +172,11 @@ async function startCamera() {
   sel.innerHTML = '<option value="">기본(후면)</option>' +
     devs.map((d, i) => `<option value="${d.deviceId}">${d.label || '카메라 ' + (i + 1)}</option>`).join('');
   sel.value = cur;
+  return true;
+}
+function showErr(msg) {
+  st.err = msg; const b = $('errbox'); b.textContent = msg; b.classList.remove('hide');
+  $('panel').classList.remove('hidden');
 }
 
 // ---------- 인코딩 ----------
